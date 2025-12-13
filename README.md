@@ -1,17 +1,28 @@
 סדר הרצה :
 
 cd backend
+
 rmdir /s /q venv
+
 python -m venv venv
+
 venv\Scripts\activate.bat
+
 python -m pip install --upgrade pip
+
 python -m pip install -r requirements.txt
+
 python train_local_model.py
+
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 
+
+
 in other terminal:
+
 cd frontend
+
 npm run dev
 
 
