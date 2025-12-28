@@ -12,7 +12,7 @@ const About = () => {
       )
     },
     {
-      name: "רון כהן",
+      name: "שילת יוספי",
       role: "UI/UX Designer",
       roleHebrew: "מעצב ממשק משתמש",
       description: "מעצב את חוויית המשתמש והממשק הגרפי של המערכת",
@@ -45,7 +45,7 @@ const About = () => {
       )
     },
     {
-      name: "שילת יוספי",
+      name: "רון כהן",
       role: "Regulatory Expert",
       roleHebrew: "מומחה רגולציה",
       description: "מוודא שהמערכת עומדת בתקנים ובתקנות הרלוונטיות",
