@@ -781,212 +781,238 @@ def get_model_manager() -> ModelManager:
 
 def classify_review(review_text: str) -> Dict[str, Any]:
     """
-    Main classification function - production-ready implementation.
-    
-    This function orchestrates the entire pipeline:
-    1. Translation (if needed)
-    2. Pattern detection
-    3. Model inference
-    4. Ensemble classification
-    5. Bias/Fraud detection (if triggered)
-    
-    Args:
-        review_text: The review text to classify (supports Hebrew)
-                    Must be a non-empty string
-        
-    Returns:
-        Dictionary with classification results and metadata.
-        All confidence and probability values are guaranteed to be in [0.0, 1.0] range.
-        
-    Raises:
-        ValueError: If input is invalid (None, empty, or wrong type)
+    גרסה משופרת ומכוילת לפרודקשן:
+    - לא "מכריזה REAL" כשאין הוכחה חזקה (מונע False-Real על זיופים חדשים)
+    - נותנת עדיפות למודל העברי המקומי + Suspicious Patterns (שזה הכי רלוונטי בעברית)
+    - משתמשת בדאטהסט רק כשיש התאמה חזקה/מדויקת (כדי לא "להעתיק" רעש)
+    - מחזירה גם UNCERTAIN באזור אפור (הכי נכון בעולם אמיתי)
     """
-    # CRITICAL: Input validation
+
+    # =========================
+    # Helpers
+    # =========================
+    def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        try:
+            return max(lo, min(hi, float(x)))
+        except Exception:
+            return 0.5
+
+    def _make_response(
+        classification: str,
+        fake_probability: float,
+        confidence: float,
+        model_used: str,
+        translated_text: str,
+        reasoning: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        out = {
+            "classification": classification,
+            "score": _clamp(confidence),
+            "fake_probability": _clamp(fake_probability),
+            "model_used": model_used,
+            "translated_text": translated_text,
+            "reasoning": reasoning or "",
+        }
+        if extra:
+            out.update(extra)
+        return out
+
+    # =========================
+    # 0) Input validation
+    # =========================
     if review_text is None:
         raise ValueError("review_text cannot be None")
-    
     if not isinstance(review_text, str):
         raise ValueError(f"review_text must be a string, got {type(review_text)}")
-    
     if not review_text.strip():
-        # Empty or whitespace-only - return uncertain result
         logger.warning("Empty review text provided")
-        return {
-            'classification': 'UNCERTAIN',
-            'score': 0.0,
-            'fake_probability': 0.5,
-            'model_used': 'Input Validation',
-            'translated_text': '',
-            'reasoning': 'Empty or whitespace-only input text',
-            'error': 'Input text is empty'
-        }
-    
-    # Initialize components
+        return _make_response(
+            classification="UNCERTAIN",
+            fake_probability=0.5,
+            confidence=0.0,
+            model_used="Input Validation",
+            translated_text="",
+            reasoning="Empty or whitespace-only input text",
+            extra={"error": "Input text is empty"},
+        )
+
+    # =========================
+    # 1) Init components
+    # =========================
     try:
         config = get_config() if ARCHITECTURE_AVAILABLE else None
         if config is None:
-            # Fallback mode
             return _classify_review_fallback(review_text)
-        
+
         model_manager = get_model_manager()
         translation_service = TranslationService(config)
         inference = ModelInference(model_manager)
         pattern_detector = SuspiciousPatternDetector(config.suspicious_patterns)
         ensemble = EnsembleClassifier(config)
-        
     except Exception as e:
         logger.error(f"Initialization error: {e}", exc_info=True)
         return _classify_review_fallback(review_text)
 
-    # 0) Exact/normalized match + high-confidence dataset matcher (no translation)
+    # ברירות מחדל לספים (אפשר לכייל ב-ml_config.py)
+    thr_fake = float(getattr(getattr(config, "thresholds", None), "fake_classification_threshold", 0.5) or 0.5)
+    # "אזור אפור" (כדי לא להכריז REAL/FAKE כשזה 50/50)
+    grey_lo, grey_hi = 0.45, 0.55
+
+    # =========================
+    # 2) Dataset exact / high-confidence matching (ללא תרגום)
+    # =========================
     try:
         norm_text = _normalize(review_text)
+
+        # (א) התאמה מדויקת = החלטה חזקה מאוד
         exact_map = model_manager.get_exact_map()
         if norm_text and norm_text in exact_map:
-            label = exact_map[norm_text]
-            logger.info(f"✅ Exact dataset match found. Label={label}")
-            return {
-                'classification': 'FAKE' if label.upper() == 'FAKE' else 'REAL',
-                'fake_probability': 0.9 if label.upper() == 'FAKE' else 0.1,
-                'confidence': 0.95,
-                'model_used': 'Dataset Exact',
-                'translated_text': review_text,
-                'reasoning': "Exact match to labeled dataset entry."
-            }
+            label = exact_map[norm_text].upper()
+            return _make_response(
+                classification="FAKE" if label == "FAKE" else "REAL",
+                fake_probability=0.92 if label == "FAKE" else 0.08,
+                confidence=0.96,
+                model_used="Dataset Exact",
+                translated_text=review_text,
+                reasoning="Exact match to labeled dataset entry (strong signal).",
+            )
 
+        # (ב) התאמת cosine/char-ngrams חזקה מאוד בלבד
         matcher = model_manager.get_dataset_matcher()
         if matcher:
-            high_conf_ds = matcher.predict(review_text)
-            if high_conf_ds:
-                conf_ds = high_conf_ds.get("confidence", 0)
-                logger.info(
-                    f"Dataset matcher result: conf={conf_ds:.3f}, "
-                    f"class={high_conf_ds.get('classification')}, "
-                    f"fake_prob={high_conf_ds.get('fake_probability', 0):.3f}"
-                )
-                # High-confidence gate kept at 0.80 for precision
-                if conf_ds >= 0.80:
-                    logger.info(
-                        f"✅ Dataset matcher high-confidence hit: conf={conf_ds:.3f}, "
-                        f"class={high_conf_ds['classification']}, fake_prob={high_conf_ds['fake_probability']:.3f}"
+            hit = matcher.predict(review_text)
+            if hit:
+                conf_ds = float(hit.get("confidence", 0.0))
+                # כאן מעלים את הסף כדי לא "לגנוב" החלטות חלשות מהדאטהסט
+                if conf_ds >= 0.85:
+                    return _make_response(
+                        classification=hit.get("classification", "UNCERTAIN"),
+                        fake_probability=float(hit.get("fake_probability", 0.5)),
+                        confidence=conf_ds,
+                        model_used="Dataset Matcher (High-Conf)",
+                        translated_text=review_text,
+                        reasoning=hit.get("reasoning", "High-confidence dataset match."),
                     )
-                    return {
-                        'classification': high_conf_ds['classification'],
-                        'fake_probability': high_conf_ds['fake_probability'],
-                        'confidence': conf_ds,
-                        'model_used': 'Dataset High-Confidence',
-                        'translated_text': review_text,
-                        'reasoning': high_conf_ds['reasoning']
-                    }
-                else:
-                    logger.info(f"Dataset matcher below high-confidence gate (0.80): conf={conf_ds:.3f}")
     except Exception as e:
-        logger.warning(f"Dataset matcher error: {e}")
-    
+        logger.warning(f"Dataset matching error: {e}")
+
+    # =========================
+    # 3) Translation (אם יש)
+    # =========================
     try:
         translated_text = translation_service.translate(review_text)
-        if translated_text != review_text:
-            logger.info(f"Translation successful: {translated_text[:100]}...")
     except Exception as e:
         logger.warning(f"Translation failed: {e}. Using original text.")
         translated_text = review_text
-    
-    # 1) Dataset-based heuristic prediction (original Hebrew text)
-    dataset_result = _predict_from_dataset(review_text, model_manager.dataset_reviews)
 
-    # 2) Pattern detection (Hebrew + English)
+    # =========================
+    # 4) Suspicious patterns (עברית + אנגלית)
+    # =========================
     try:
-        patterns_hebrew = pattern_detector.detect_all_patterns(review_text)  # Original Hebrew
-        patterns_english = pattern_detector.detect_all_patterns(translated_text)  # Translated English
+        patterns_he = pattern_detector.detect_all_patterns(review_text)
+        patterns_en = pattern_detector.detect_all_patterns(translated_text) if translated_text != review_text else {}
 
+        # מיזוג לפי confidence הגבוה יותר
         suspicious_patterns = {}
-        for pattern_type, match in patterns_hebrew.items():
-            suspicious_patterns[pattern_type] = match
-        for pattern_type, match in patterns_english.items():
-            if pattern_type in suspicious_patterns:
-                if match.confidence > suspicious_patterns[pattern_type].confidence:
-                    suspicious_patterns[pattern_type] = match
+        for k, v in (patterns_he or {}).items():
+            suspicious_patterns[k] = v
+        for k, v in (patterns_en or {}).items():
+            if k in suspicious_patterns:
+                if getattr(v, "confidence", 0.0) > getattr(suspicious_patterns[k], "confidence", 0.0):
+                    suspicious_patterns[k] = v
             else:
-                suspicious_patterns[pattern_type] = match
+                suspicious_patterns[k] = v
 
-        suspicious_score = pattern_detector.calculate_suspicious_score(suspicious_patterns, review_text)
-        if suspicious_score > 0:
-            pattern_summary = ", ".join([f"{k}:{v.confidence:.2f}" for k, v in suspicious_patterns.items()])
-            logger.info(
-                f"Suspicious patterns detected: {suspicious_score:.2f} "
-                f"(Hebrew: {len(patterns_hebrew)}, English: {len(patterns_english)}) | {pattern_summary}"
-            )
+        suspicious_score = float(pattern_detector.calculate_suspicious_score(suspicious_patterns, review_text))
+        suspicious_score = _clamp(suspicious_score)
     except Exception as e:
         logger.warning(f"Pattern detection error: {e}")
-        suspicious_patterns = {}
-        suspicious_score = 0.0
+        suspicious_patterns, suspicious_score = {}, 0.0
 
-    # 3) Model inference (Hebrew AI detector + English detectors)
+    # =========================
+    # 5) Model inference
+    # =========================
+    # מודל עברי מקומי (הכי חשוב אצלך כי הוא מאומן על הדאטהסט שלך)
+    local_hebrew_output = None
+    hebrew_ai_output = None
+    model1_output = None
+    model2_output = None
+
     try:
-        # 🔹 דטקטור עברית (קיים אצלך כבר)
-        hebrew_ai_output = inference.run_hebrew_ai_detector(review_text)
-        if hebrew_ai_output:
-            logger.info(
-                f"Hebrew AI detector: fake={hebrew_ai_output.fake_score:.2%}, "
-                f"real={hebrew_ai_output.real_score:.2%}"
-            )
+        hebrew_ai_output = inference.run_hebrew_ai_detector(review_text)  # יכול להיות None
+    except Exception as e:
+        logger.warning(f"Hebrew AI detector error: {e}")
 
-        # 🔹 המודל המקומי החדש בעברית (TF-IDF / לוגיסטי וכו')
-        local_hebrew_output = inference.run_local_hebrew_model(review_text)
+    try:
+        local_hebrew_output = inference.run_local_hebrew_model(review_text)  # יכול להיות None
+    except Exception as e:
+        logger.warning(f"Local Hebrew model error: {e}")
 
-
-        # 🔹 אם המודל העברי די בטוח בעצמו – נותנים לו להחליט עם סף FAKE רגיש יותר
-        if local_hebrew_output and local_hebrew_output.confidence >= 0.65:
-            fake = float(local_hebrew_output.fake_score)
-            # להעדיף זיהוי זיופים → סף נמוך יותר, למשל 0.40
-            threshold = 0.40  
-            return {
-                'classification': 'FAKE' if fake >= threshold else 'REAL',
-                'score': local_hebrew_output.confidence,
-                'fake_probability': fake,
-                'model_used': f'Hebrew TF-IDF (high confidence, thr={threshold})',
-                'translated_text': review_text,
-                'reasoning': (
-                    f"Local Hebrew TF-IDF model is confident "
-                    f"(conf={local_hebrew_output.confidence:.2f}, fake={fake:.2f}) "
-                    f"with FAKE threshold={threshold:.2f}."
-                )
-            }
-
-
-
-        # 🔹 מודל 1 – Classifier על הטקסט המתורגם
+    try:
+        # מודל 1+2 עובדים על הטקסט המתורגם (אם קיימים)
         model1_output = inference.run_review_classifier(translated_text)
-
-        # 🔹 מודל 2 – AI detector על הטקסט המתורגם
         model2_output = inference.run_ai_detector(translated_text)
 
-        # Combine Hebrew AI detector with English AI detector (prioritize Hebrew signal)
-        if hebrew_ai_output and hebrew_ai_output.fake_score > 0.3:
-            combined_fake = (hebrew_ai_output.fake_score * 0.7) + (model2_output.fake_score * 0.3)
-            combined_real = (hebrew_ai_output.real_score * 0.3) + (model2_output.real_score * 0.7)
+        # אם יש סיגנל עברי ל-AI, נשלב אותו בזהירות (לא להשתלט)
+        if hebrew_ai_output and getattr(hebrew_ai_output, "fake_score", 0.0) > 0.30:
+            hf = float(hebrew_ai_output.fake_score)
+            hr = float(hebrew_ai_output.real_score)
+            ef = float(model2_output.fake_score)
+            er = float(model2_output.real_score)
+
+            combined_fake = 0.65 * hf + 0.35 * ef
+            combined_real = 0.35 * hr + 0.65 * er
             total = combined_fake + combined_real
             if total > 0:
                 combined_fake /= total
                 combined_real /= total
+
             model2_output = ModelOutput(
-                fake_score=max(0.0, min(1.0, combined_fake)),
-                real_score=max(0.0, min(1.0, combined_real)),
-                confidence=max(0.0, min(1.0, abs(combined_fake - combined_real))),
-                model_name=model2_output.model_name,
-                raw_output=model2_output.raw_output
+                fake_score=_clamp(combined_fake),
+                real_score=_clamp(combined_real),
+                confidence=_clamp(abs(combined_fake - combined_real)),
+                model_name=getattr(model2_output, "model_name", "AI Detector"),
+                raw_output=getattr(model2_output, "raw_output", None),
             )
-            logger.info(f"Combined AI detectors (Hebrew + English): fake={model2_output.fake_score:.2%}, real={model2_output.real_score:.2%}")
     except Exception as e:
         logger.error(f"Model inference error: {e}", exc_info=True)
-        return {
-            'classification': 'UNCERTAIN',
-            'score': 0.5,
-            'model_used': 'Error',
-            'translated_text': translated_text,
-            'error': str(e)
-        }
-    
+        # אם המודלים נפלו, נבנה החלטה מהירה על בסיס local+patterns
+        # (עדיף UNCERTAIN מאשר REAL בטעות)
+        fallback_fake = 0.5
+        fallback_conf = 0.4
+
+        if local_hebrew_output:
+            fallback_fake = _clamp(getattr(local_hebrew_output, "fake_score", 0.5))
+            fallback_conf = max(fallback_conf, _clamp(getattr(local_hebrew_output, "confidence", 0.0)))
+
+        # חשד גבוה מעלה את fake_prob מעט
+        fallback_fake = _clamp(fallback_fake + 0.25 * suspicious_score)
+        fallback_conf = _clamp(max(fallback_conf, abs(fallback_fake - 0.5) * 2))
+
+        # החלטה שמרנית: באזור אפור -> UNCERTAIN
+        if grey_lo <= fallback_fake <= grey_hi:
+            cls = "UNCERTAIN"
+        else:
+            cls = "FAKE" if fallback_fake >= thr_fake else "REAL"
+
+        # לא מחזירים REAL אם יש חשד משמעותי
+        if cls == "REAL" and suspicious_score >= 0.40:
+            cls = "UNCERTAIN"
+
+        return _make_response(
+            classification=cls,
+            fake_probability=fallback_fake,
+            confidence=fallback_conf,
+            model_used="Fallback (local/patterns)",
+            translated_text=translated_text,
+            reasoning=f"Model inference failed; used local+patterns. suspicious_score={suspicious_score:.2f}",
+            extra={"error": str(e)},
+        )
+
+    # =========================
+    # 6) Ensemble classification (בסיס)
+    # =========================
     try:
         result = ensemble.classify(
             model1_output=model1_output,
@@ -994,221 +1020,155 @@ def classify_review(review_text: str) -> Dict[str, Any]:
             suspicious_patterns=suspicious_patterns,
             suspicious_score=suspicious_score,
             translated_text=translated_text,
-            original_text=review_text
+            original_text=review_text,
         )
-
-
-                # 🔹 שילוב המודל המקומי בעברית (TF-IDF) לפני השוואה לדאטהסט
-        if local_hebrew_output:
-            logger.info(
-                "Local Hebrew TF-IDF model: fake=%.3f, real=%.3f, conf=%.3f",
-                local_hebrew_output.fake_score,
-                local_hebrew_output.real_score,
-                local_hebrew_output.confidence,
-            )
-
-            # אם המודל העברי די בטוח בעצמו – נותנים לו משקל גבוה
-            if local_hebrew_output.confidence >= 0.65:
-                # משקל 60% למודל העברי, 40% לתוצאה של ה-ensemble
-                combined_fake = (
-                    0.6 * local_hebrew_output.fake_score
-                    + 0.4 * result.fake_probability
-                )
-                result.fake_probability = combined_fake
-                result.classification = "FAKE" if combined_fake >= 0.5 else "REAL"
-                # הביטחון: המקסימום בין הביטחון הקודם לבין המודל העברי
-                result.confidence = max(
-                    result.confidence,
-                    local_hebrew_output.confidence,
-                    abs(combined_fake - 0.5) * 2,  # כמה רחוק מ-50%
-                )
-                result.model_used = (result.model_used + " + Hebrew TF-IDF").strip()
-                result.reasoning = (
-                    f"Hebrew TF-IDF model (conf={local_hebrew_output.confidence:.2f}, "
-                    f"fake={local_hebrew_output.fake_score:.2f}) combined with ensemble. "
-                    + result.reasoning
-                )
-            # אם ה-ensemble מתלבט (conf < 0.6), נשתמש במודל העברי כ-tie-breaker חלש יותר
-            elif result.confidence < 0.6:
-                combined_fake = (
-                    0.5 * local_hebrew_output.fake_score
-                    + 0.5 * result.fake_probability
-                )
-                result.fake_probability = combined_fake
-                result.classification = "FAKE" if combined_fake >= 0.5 else "REAL"
-                result.confidence = max(
-                    result.confidence,
-                    local_hebrew_output.confidence,
-                    0.6
-                )
-                result.model_used = (result.model_used + " + Hebrew TF-IDF (tie-break)").strip()
-                result.reasoning = (
-                    "Ensemble was uncertain; Hebrew TF-IDF model used as tie-breaker. "
-                    + result.reasoning
-                )
-
-
-        # Compare dataset heuristic vs ensemble result
-        # Use dataset if it has higher confidence OR if ensemble is uncertain
-        dataset_confidence = dataset_result.get('confidence', 0) if dataset_result else 0
-        use_dataset = False
-        
-        if dataset_result:
-            ds_class = dataset_result.get('classification')
-            ds_fake = dataset_result.get('fake_probability', 0)
-            logger.info(
-                f"Dataset result: classification={ds_class}, confidence={dataset_confidence:.3f}, "
-                f"fake_prob={ds_fake:.3f}, reasoning={dataset_result.get('reasoning')}"
-            )
-            logger.info(
-                f"Ensemble result: classification={result.classification}, confidence={result.confidence:.3f}, "
-                f"fake_prob={result.fake_probability:.3f}, suspicious_score={suspicious_score:.3f}"
-            )
-            
-            # Strong rule: if dataset says FAKE with signal >=0.20, favor it unless ensemble is very confidently REAL
-            if ds_class == "FAKE" and dataset_confidence >= 0.20:
-                if not (result.classification.startswith("REAL") and result.confidence >= 0.80):
-                    use_dataset = True
-                    logger.info("✅ Dataset override: FAKE label with sufficient similarity (>=0.20)")
-            
-            # Strong rule: if dataset says REAL with signal >=0.35 and ensemble not strongly FAKE, favor REAL
-            if ds_class == "REAL" and dataset_confidence >= 0.35:
-                if result.fake_probability < 0.60 and model2_output.fake_score < 0.35:
-                    use_dataset = True
-                    logger.info("✅ Dataset override: REAL label with sufficient similarity (>=0.35) and no strong FAKE signal")
-            
-            # Use dataset if higher confidence than ensemble
-            if not use_dataset and dataset_confidence > result.confidence:
-                use_dataset = True
-                logger.info(f"✅ Dataset-based decision used (confidence {dataset_confidence:.3f}) over ensemble ({result.confidence:.3f})")
-            
-            # If ensemble is uncertain, lean on dataset signal >0.3
-            if not use_dataset and result.confidence < 0.6 and dataset_confidence > 0.3:
-                use_dataset = True
-                logger.info(f"✅ Dataset-based decision used (confidence {dataset_confidence:.3f}) - ensemble uncertain ({result.confidence:.3f})")
-            
-            # If dataset has decent confidence, blend with ensemble when both are reasonable
-            if not use_dataset and dataset_confidence > 0.5:
-                combined_fake = (ds_fake * 0.6) + (result.fake_probability * 0.4)
-                combined_confidence = (dataset_confidence * 0.6) + (result.confidence * 0.4)
-                if dataset_confidence > 0.7:
-                    result.classification = ds_class
-                    result.fake_probability = combined_fake
-                    result.confidence = combined_confidence
-                    result.model_used = "Dataset + Ensemble (weighted)"
-                    result.reasoning = f"Dataset match ({dataset_confidence:.2f}) combined with ensemble analysis. {dataset_result['reasoning']}"
-                    logger.info(f"✅ Combined dataset ({dataset_confidence:.3f}) + ensemble ({result.confidence:.3f}) = {combined_confidence:.3f}")
-            
-            if not use_dataset and dataset_confidence > 0:
-                logger.info(f"⚠️ Dataset match found but not used: dataset_conf={dataset_confidence:.3f} <= ensemble_conf={result.confidence:.3f}")
-        
-        if use_dataset:
-            result.classification = dataset_result['classification']
-            result.fake_probability = dataset_result['fake_probability']
-            result.confidence = max(dataset_result['confidence'], result.confidence)
-            result.model_used = "Dataset Heuristic"
-            # Preserve ensemble reasoning as fallback context
-            result.reasoning = f"{dataset_result['reasoning']} | Ensemble: {result.reasoning}"
-
-        # Final tie-break to avoid neutral 50/50 outcomes
-        if result.confidence < 0.55:
-            logger.info(
-                f"Tie-break triggered (conf={result.confidence:.3f}). "
-                f"AI detector: fake={model2_output.fake_score:.3f}, real={model2_output.real_score:.3f}; "
-                f"suspicious_score={suspicious_score:.3f}"
-            )
-            # Prefer dataset if any usable signal remains
-            if dataset_result and dataset_confidence >= 0.20:
-                result.classification = dataset_result['classification']
-                result.fake_probability = dataset_result['fake_probability']
-                result.confidence = max(result.confidence, dataset_confidence, 0.6)
-                result.model_used = "Dataset Heuristic (tie-break)"
-                result.reasoning = f"Tie-break: dataset signal used. {dataset_result['reasoning']} | Ensemble: {result.reasoning}"
-            else:
-                # Fall back to strongest AI detector signal
-                if model2_output.fake_score - model2_output.real_score > 0.08:
-                    result.classification = 'FAKE'
-                    result.fake_probability = max(result.fake_probability, model2_output.fake_score, 0.6)
-                    result.confidence = max(result.confidence, abs(model2_output.fake_score - model2_output.real_score), 0.6)
-                    result.reasoning = (
-                        f"Tie-break: AI detector favors fake ({model2_output.fake_score:.2%} vs "
-                        f"{model2_output.real_score:.2%}). Suspicious_score={suspicious_score:.2f}."
-                    )
-                elif model2_output.real_score - model2_output.fake_score > 0.15 and suspicious_score < 0.5:
-                    result.classification = 'REAL'
-                    result.fake_probability = min(result.fake_probability, 0.4)
-                    result.confidence = max(result.confidence, abs(model2_output.real_score - model2_output.fake_score), 0.6)
-                    result.reasoning = (
-                        f"Tie-break: AI detector favors real ({model2_output.real_score:.2%} vs "
-                        f"{model2_output.fake_score:.2%}) with low suspicious patterns ({suspicious_score:.2f})."
-                    )
-                else:
-                    # If still ambiguous, lean on suspicious patterns
-                    if suspicious_score >= 0.4:
-                        result.classification = 'FAKE'
-                        result.fake_probability = max(result.fake_probability, 0.6)
-                        result.confidence = max(result.confidence, 0.6)
-                        result.reasoning = (
-                            f"Tie-break: suspicious patterns ({suspicious_score:.2f}) push classification to FAKE."
-                        )
-                    else:
-                        result.classification = 'REAL'
-                        result.fake_probability = min(result.fake_probability, 0.35)
-                        result.confidence = max(result.confidence, 0.55)
-                        result.reasoning = (
-                            f"Tie-break: low suspicious patterns ({suspicious_score:.2f}) and no strong AI signal."
-                        )
-        
-        bias_fraud_result = None
-        if ARCHITECTURE_AVAILABLE and BiasFraudDetector and model_manager.has_bias_fraud_models():
-            try:
-                bias_fraud_detector = BiasFraudDetector(config)
-                bias_fraud_detector.load_models(
-                    model_manager.fraud_detector,
-                    None  # Bias detector removed - not relevant
-                )
-                bias_fraud_result = bias_fraud_detector.check(
-                    translated_text,
-                    model1_output,
-                    model2_output
-                )
-                if bias_fraud_result:
-                    logger.info(f"🚨 {bias_fraud_result.classification} detected with score {bias_fraud_result.score:.4f}")
-                    # Bias/Fraud detection overrides everything - it indicates non-objective origin
-                    result.classification = bias_fraud_result.classification
-                    result.confidence = bias_fraud_result.confidence
-                    result.fake_probability = bias_fraud_result.score
-                    result.model_used = f"{result.model_used} + {bias_fraud_result.model_used}"
-                    result.reasoning = f"Non-objective origin detected: {bias_fraud_result.classification} ({bias_fraud_result.score:.2%}). {result.reasoning}"
-            except Exception as e:
-                logger.warning(f"Bias/Fraud detection error: {e}. Continuing with ensemble result.")
-        
-        # Convert to API format
-        return {
-            'classification': result.classification,
-            'score': result.confidence,
-            'fake_probability': result.fake_probability,
-            'model_used': result.model_used,
-            'translated_text': translated_text,
-            'reasoning': result.reasoning,
-            'm1_cg_score': model1_output.fake_score,
-            'm1_real_score': model1_output.real_score,
-            'm2_generated_score': model2_output.fake_score,
-            'm2_real_score': model2_output.real_score,
-            'suspicious_score': suspicious_score,
-            'suspicious_patterns': {k: v.description for k, v in suspicious_patterns.items()},
-            'bias_fraud_detected': bias_fraud_result.classification if bias_fraud_result else None,
-            'bias_fraud_score': bias_fraud_result.score if bias_fraud_result else None
-        }
     except Exception as e:
         logger.error(f"Ensemble classification error: {e}", exc_info=True)
-        return {
-            'classification': 'UNCERTAIN',
-            'score': 0.5,
-            'model_used': 'Error',
-            'translated_text': translated_text,
-            'error': str(e)
-        }
+        # fallback: local + patterns + ai_detector
+        base_fake = _clamp(getattr(model2_output, "fake_score", 0.5))
+        base_conf = _clamp(getattr(model2_output, "confidence", 0.0))
+
+        if local_hebrew_output:
+            lf = _clamp(getattr(local_hebrew_output, "fake_score", 0.5))
+            lc = _clamp(getattr(local_hebrew_output, "confidence", 0.0))
+            # שילוב שמעדיף את המודל העברי
+            base_fake = _clamp(0.70 * lf + 0.30 * base_fake)
+            base_conf = max(base_conf, lc)
+
+        base_fake = _clamp(base_fake + 0.20 * suspicious_score)
+        base_conf = _clamp(max(base_conf, abs(base_fake - 0.5) * 2))
+
+        if grey_lo <= base_fake <= grey_hi:
+            cls = "UNCERTAIN"
+        else:
+            cls = "FAKE" if base_fake >= thr_fake else "REAL"
+
+        # לא מחזירים REAL אם יש חשד
+        if cls == "REAL" and suspicious_score >= 0.40:
+            cls = "UNCERTAIN"
+
+        return _make_response(
+            classification=cls,
+            fake_probability=base_fake,
+            confidence=base_conf,
+            model_used="Ensemble Failed -> Local/AI/Patterns",
+            translated_text=translated_text,
+            reasoning=f"Ensemble failed; combined local/AI/patterns. suspicious_score={suspicious_score:.2f}",
+            extra={"error": str(e)},
+        )
+
+    # =========================
+    # 7) Fuse signals (החלק החשוב!)
+    # =========================
+    # נתחיל מה-ensemble כתוצאה בסיסית
+    fused_fake = _clamp(getattr(result, "fake_probability", 0.5))
+    fused_conf = _clamp(getattr(result, "confidence", 0.5))
+
+    # (א) הזרקת Suspicious patterns: חשד גבוה מעלה fake_prob
+    # רעיון: אם יש הרבה דפוסים גנריים/שיווקיים => זה מעלה חשד לזיוף
+    fused_fake = _clamp(fused_fake + 0.25 * suspicious_score)
+
+    # (ב) שילוב המודל העברי המקומי (הכי חשוב אצלך)
+    if local_hebrew_output:
+        lf = _clamp(getattr(local_hebrew_output, "fake_score", 0.5))
+        lc = _clamp(getattr(local_hebrew_output, "confidence", 0.0))
+
+        # אם המודל העברי בטוח -> משקל גבוה
+        if lc >= 0.65:
+            fused_fake = _clamp(0.70 * lf + 0.30 * fused_fake)
+            fused_conf = _clamp(max(fused_conf, lc, abs(fused_fake - 0.5) * 2))
+            result.model_used = (getattr(result, "model_used", "") + " + HebrewTFIDF(Strong)").strip()
+            result.reasoning = (
+                f"Hebrew TF-IDF strong signal (conf={lc:.2f}, fake={lf:.2f}) fused. "
+                + (getattr(result, "reasoning", "") or "")
+            )
+        else:
+            # אם ה-ensemble לא בטוח, המודל העברי יכול לשבור תיקו
+            if fused_conf < 0.60:
+                fused_fake = _clamp(0.55 * lf + 0.45 * fused_fake)
+                fused_conf = _clamp(max(fused_conf, 0.60, lc, abs(fused_fake - 0.5) * 2))
+                result.model_used = (getattr(result, "model_used", "") + " + HebrewTFIDF(TieBreak)").strip()
+                result.reasoning = (
+                    f"Hebrew TF-IDF used as tie-break (conf={lc:.2f}, fake={lf:.2f}). "
+                    + (getattr(result, "reasoning", "") or "")
+                )
+
+    # (ג) סיגנל AI detector (חלש יותר אצלך, כי זה לא מודל Fake-Review אמיתי)
+    # רק אם הוא נותן דחיפה חזקה לכיוון FAKE
+    ai_fake = _clamp(getattr(model2_output, "fake_score", 0.5))
+    ai_real = _clamp(getattr(model2_output, "real_score", 0.5))
+    ai_margin = ai_fake - ai_real
+    if ai_margin > 0.20:
+        fused_fake = _clamp(0.85 * fused_fake + 0.15 * ai_fake)
+        fused_conf = _clamp(max(fused_conf, abs(fused_fake - 0.5) * 2))
+
+    # =========================
+    # 8) Decision policy (מונע False REAL)
+    # =========================
+    # Confidence recalibration (לא רק מהמודלים): כמה רחוק מ-0.5
+    fused_conf = _clamp(max(fused_conf, abs(fused_fake - 0.5) * 2))
+
+    # כלל בטיחות: אם יש חשד משמעותי, לא מחזירים REAL
+    if suspicious_score >= 0.40 and fused_fake < 0.50:
+        # במקום "REAL", עדיף UNCERTAIN
+        fused_fake = max(fused_fake, 0.50)  # דוחף לאזור האפור
+        fused_conf = max(fused_conf, 0.60)
+
+    # החלטה תלת-מצבית:
+    # - FAKE אם מעל סף
+    # - REAL אם מתחת לסף אמיתיות מחמיר
+    # - אחרת UNCERTAIN
+    real_strict_thr = min(0.40, 1.0 - thr_fake)  # מחמיר כדי לא "לשחרר" REAL בטעות
+    if fused_fake >= thr_fake:
+        final_cls = "FAKE"
+    elif fused_fake <= real_strict_thr and suspicious_score < 0.30 and fused_conf >= 0.65:
+        final_cls = "REAL"
+    else:
+        final_cls = "UNCERTAIN"
+
+    # =========================
+    # 9) Bias/Fraud (אופציונלי) - יכול לדרוס הכל
+    # =========================
+    bias_fraud_result = None
+    if ARCHITECTURE_AVAILABLE and BiasFraudDetector and model_manager.has_bias_fraud_models():
+        try:
+            bias_fraud_detector = BiasFraudDetector(config)
+            bias_fraud_detector.load_models(model_manager.fraud_detector, None)
+            bias_fraud_result = bias_fraud_detector.check(translated_text, model1_output, model2_output)
+            if bias_fraud_result:
+                final_cls = bias_fraud_result.classification
+                fused_conf = _clamp(bias_fraud_result.confidence)
+                fused_fake = _clamp(bias_fraud_result.score)
+                result.model_used = (getattr(result, "model_used", "") + " + FraudDetector").strip()
+                result.reasoning = (
+                    f"Non-objective origin detected: {bias_fraud_result.classification} ({bias_fraud_result.score:.2%}). "
+                    + (getattr(result, "reasoning", "") or "")
+                )
+        except Exception as e:
+            logger.warning(f"Bias/Fraud detection error: {e}. Continuing.")
+
+    # =========================
+    # 10) Build final response
+    # =========================
+    return _make_response(
+        classification=final_cls,
+        fake_probability=fused_fake,
+        confidence=fused_conf,
+        model_used=getattr(result, "model_used", "Ensemble+Fusion"),
+        translated_text=translated_text,
+        reasoning=getattr(result, "reasoning", ""),
+        extra={
+            "m1_cg_score": _clamp(getattr(model1_output, "fake_score", 0.5)),
+            "m1_real_score": _clamp(getattr(model1_output, "real_score", 0.5)),
+            "m2_generated_score": _clamp(getattr(model2_output, "fake_score", 0.5)),
+            "m2_real_score": _clamp(getattr(model2_output, "real_score", 0.5)),
+            "suspicious_score": _clamp(suspicious_score),
+            "suspicious_patterns": {k: getattr(v, "description", "") for k, v in (suspicious_patterns or {}).items()},
+            "bias_fraud_detected": getattr(bias_fraud_result, "classification", None) if bias_fraud_result else None,
+            "bias_fraud_score": getattr(bias_fraud_result, "score", None) if bias_fraud_result else None,
+        },
+    )
+
 
 
 def _classify_review_fallback(review_text: str) -> Dict[str, Any]:
