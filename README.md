@@ -27,6 +27,11 @@ npm run dev
 
 
 
+הרצת בדיקות:
+
+pytest -q
+
+pytest -q tests/test_api_contract.py tests/test_api_with_mocked_ai.py
 
 
 # Fake Review Detector
