@@ -8,7 +8,6 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.metrics import classification_report
 
-# --- 1. פונקציית ניקוי טקסט משופרת לעברית ---
 def clean_hebrew_text(text):
     if not isinstance(text, str):
         return ""
@@ -36,7 +35,7 @@ df = df[df["label"].isin(["REAL", "FAKE"])]
 # הפעלת הניקוי המתקדם על הטקסט
 df["review_text"] = df["review_text"].apply(clean_hebrew_text)
 
-# הסרת כפילויות *אחרי* הניקוי (יותר יעיל)
+# הסרת כפילויות *אחרי* הניקוי  
 df = df.drop_duplicates(subset=["review_text"])
 
 texts = df["review_text"].astype(str)
@@ -112,4 +111,4 @@ models_dir = BASE_DIR / "models"
 models_dir.mkdir(exist_ok=True)
 model_path = models_dir / "hebrew_fake_review_tfidf.joblib"
 joblib.dump(best_model, model_path)
-print(f"✅ Improved model saved to {model_path}")
+print(f" Improved model saved to {model_path}")

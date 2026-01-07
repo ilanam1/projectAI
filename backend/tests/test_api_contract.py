@@ -1,7 +1,6 @@
 import pytest
 from fastapi.testclient import TestClient
 
-# מייבאים את האפליקציה שלך
 from main import app
 
 client = TestClient(app)
@@ -50,7 +49,6 @@ def test_predict_contract_english_smoke():
 
 
 def test_predict_rejects_empty_by_pydantic():
-    # Pydantic min_length=1 אמור להפיל
     r = client.post("/predict", json={"text": ""})
     assert r.status_code in (422, 400)
 
@@ -72,7 +70,6 @@ def test_batch_contract_smoke():
     assert "fake_count" in data
     assert "uncertain_count" in data
 
-    # סכומים צריכים להסתכם ל-total
     assert data["real_count"] + data["fake_count"] + data["uncertain_count"] == 3
 
     assert 0.0 <= float(data["real_percentage"]) <= 100.0
@@ -80,7 +77,6 @@ def test_batch_contract_smoke():
 
     assert isinstance(data.get("recommendation", ""), str)
 
-    # תוצאות פרטניות
     results = data.get("individual_results", [])
     assert len(results) == 3
     for item in results:

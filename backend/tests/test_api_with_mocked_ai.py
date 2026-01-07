@@ -1,7 +1,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
-import main  # זה המודול שבו ה-app שלך יושב
+import main  
 
 
 @pytest.fixture()
@@ -20,7 +20,6 @@ def test_predict_mocked_classify_review(monkeypatch, client):
             "reasoning": "Mocked result for test stability."
         }
 
-    # patch לפונקציה שה-main ייבא: from ml_model import classify_review
     monkeypatch.setattr(main, "classify_review", fake_classify_review)
 
     r = client.post("/predict", json={"text": "מוצר משוגע! ממליץ בחום!"})
@@ -43,7 +42,6 @@ def test_batch_mocked_classify_review(monkeypatch, client):
     ]
 
     def fake_classify_review(text: str):
-        # מוציא לפי אורך טקסט רק כדי לייצר שונות
         if len(text) < 10:
             return outputs[2]
         if "מומלץ" in text or "recommend" in text:

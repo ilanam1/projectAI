@@ -245,7 +245,7 @@ class ModelManager:
         self.bias_detector = None
         self.translator_initialized = False
         self._dataset_matcher = None
-        self.local_hebrew_model = None  # ✅ להגדיר לפני הטעינה
+        self.local_hebrew_model = None  
         self._load_models()   
 
     # ---------------- Dataset cache ----------------
@@ -354,7 +354,7 @@ class ModelManager:
                     device=self.config.review_classifier.device,
                     return_all_scores=self.config.review_classifier.return_all_scores
                 )
-                logger.info(f"✅ {self.config.review_classifier.name} loaded successfully")
+                logger.info(f" {self.config.review_classifier.name} loaded successfully")
             
             # Load Hebrew AI Detector (runs on original Hebrew text before translation)
             if self.config.hebrew_ai_detector:
@@ -366,9 +366,9 @@ class ModelManager:
                         device=self.config.hebrew_ai_detector.device,
                         return_all_scores=self.config.hebrew_ai_detector.return_all_scores
                     )
-                    logger.info(f"✅ {self.config.hebrew_ai_detector.name} loaded successfully")
+                    logger.info(f" {self.config.hebrew_ai_detector.name} loaded successfully")
                 except Exception as e:
-                    logger.warning(f"⚠️ Could not load Hebrew AI detector: {e}. Continuing without it.")
+                    logger.warning(f" Could not load Hebrew AI detector: {e}. Continuing without it.")
                     self.hebrew_ai_detector = None
             
             # Load AI Detector (Model 2) - English
@@ -380,7 +380,7 @@ class ModelManager:
                     device=self.config.ai_detector.device,
                     return_all_scores=self.config.ai_detector.return_all_scores
                 )
-                logger.info(f"✅ {self.config.ai_detector.name} loaded successfully")
+                logger.info(f" {self.config.ai_detector.name} loaded successfully")
             
             # Load Fraud Detector (Model A) - Optional
             if self.config.fraud_detector:
@@ -392,9 +392,9 @@ class ModelManager:
                         device=self.config.fraud_detector.device,
                         return_all_scores=self.config.fraud_detector.return_all_scores
                     )
-                    logger.info(f"✅ {self.config.fraud_detector.name} loaded successfully")
+                    logger.info(f" {self.config.fraud_detector.name} loaded successfully")
                 except Exception as e:
-                    logger.warning(f"⚠️ Could not load fraud detector: {e}. Continuing without it.")
+                    logger.warning(f" Could not load fraud detector: {e}. Continuing without it.")
                     self.fraud_detector = None
             
             # Bias Detector removed - not relevant for review detection
@@ -404,10 +404,10 @@ class ModelManager:
             # Initialize translation
             if self.config.translation_enabled and TRANSLATION_AVAILABLE:
                 self.translator_initialized = True
-                logger.info("✅ Translation service ready")
+                logger.info(" Translation service ready")
             
         except Exception as e:
-            logger.error(f"❌ Error loading models: {e}", exc_info=True)
+            logger.error(f" Error loading models: {e}", exc_info=True)
             raise
 
 
@@ -419,7 +419,7 @@ class ModelManager:
             if model_path.exists():
                 logger.info(f"Loading local Hebrew TF-IDF model from {model_path}...")
                 self.local_hebrew_model = joblib.load(model_path)
-                logger.info("✅ Local Hebrew TF-IDF model loaded")
+                logger.info(" Local Hebrew TF-IDF model loaded")
             else:
                 logger.warning(f"Local Hebrew model not found at {model_path}")
         except Exception as e:
@@ -788,9 +788,6 @@ def classify_review(review_text: str) -> Dict[str, Any]:
     - מחזירה גם UNCERTAIN באזור אפור (הכי נכון בעולם אמיתי)
     """
 
-    # =========================
-    # Helpers
-    # =========================
     def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
         try:
             return max(lo, min(hi, float(x)))
